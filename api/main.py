@@ -127,50 +127,68 @@ def ingest_text(req: IngestText):
 
 @app.post("/generate/concepts")
 def generate_concepts(req: GenerateReq):
-    q = f"Industry: {req.industry}\nService: {req.service}\nAudience: {req.audience}\nLevers: {', '.join(req.levers)}"
+    # build a short query out of the form
+    q = (
+        f"Industry: {req.industry}\n"
+        f"Service: {req.service}\n"
+        f"Audience: {req.audience}\n"
+        f"Levers: {', '.join(req.levers)}"
+    )
+    # get one embedding vector for that query
     q_vec = embed([q])[0]
+
+    # pull nearest chunks from your own ads + inspo
     with get_conn() as conn:
         internal = conn.execute(
             """
-            select text_chunk from embeddings e
+            select text_chunk
+            from embeddings e
             join documents d on d.id = e.doc_id
             where d.source_type = 'internal'
-            order by e.embedding <=> %s
+            order by e.embedding <=> %s::vector
             limit 8
             """,
             (q_vec,),
         ).fetchall()
+
         inspo = conn.execute(
             """
-            select text_chunk from embeddings e
+            select text_chunk
+            from embeddings e
             join documents d on d.id = e.doc_id
             where d.source_type = 'inspo'
-            order by e.embedding <=> %s
+            order by e.embedding <=> %s::vector
             limit 4
             """,
             (q_vec,),
         ).fetchall()
+
+    # stitch together context for the model
     ctx = "\n\n".join([r["text_chunk"] for r in (internal + inspo)])
     user_prompt = (
-        f"CONTEXT (internal first, then inspo):\n{ctx}\n\n"
+        f"CONTEXT:\n{ctx}\n\n"
         f"INPUTS:\nIndustry: {req.industry}\nService: {req.service}\nAudience: {req.audience}\n"
-        f"Platforms: {', '.join(req.platforms)}\nLevers: {', '.join(req.levers)}\n\n"
-        + CONCEPT_FORMAT.format(n=req.n)
-    )
+        f"Levers: {req.levers}\n"
+        "Produce {n} numbered concepts. Each with Hook, Premise, 3 Escalations, CTA."
+    ).format(n=req.n)
+
     chat = client.chat.completions.create(
         model=GEN_MODEL,
         messages=[
-            {"role": "system", "content": PITCH_SYSTEM_PROMPT},
+            {"role": "system", "content": "You are Happy Face Ads’ writers-room engine. Bold, absurd, against-the-grain, comedic."},
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.9,
     )
     text = chat.choices[0].message.content
+
+    # save the brief
     with get_conn() as conn, conn.transaction():
         brief = conn.execute(
             "insert into briefs(inputs, output_md) values (%s,%s) returning id",
             (json.dumps(req.dict()), text),
         ).fetchone()
+
     return {"brief_id": brief["id"], "markdown": text}
 
 @app.post("/generate/rewrite")
