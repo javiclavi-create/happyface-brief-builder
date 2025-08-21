@@ -127,17 +127,16 @@ def ingest_text(req: IngestText):
 
 @app.post("/generate/concepts")
 def generate_concepts(req: GenerateReq):
-    # build a short query out of the form
+    # 1) Build a short search query from the form
     q = (
         f"Industry: {req.industry}\n"
         f"Service: {req.service}\n"
         f"Audience: {req.audience}\n"
         f"Levers: {', '.join(req.levers)}"
     )
-    # get one embedding vector for that query
     q_vec = embed([q])[0]
 
-    # pull nearest chunks from your own ads + inspo
+    # 2) Retrieve nearest chunks from your library
     with get_conn() as conn:
         internal = conn.execute(
             """
@@ -163,33 +162,69 @@ def generate_concepts(req: GenerateReq):
             (q_vec,),
         ).fetchall()
 
-    # stitch together context for the model
     ctx = "\n\n".join([r["text_chunk"] for r in (internal + inspo)])
+
+    # 3) Ask the model for STRICT JSON
+    schema_hint = {
+        "concepts": [
+            {
+                "title": "string",
+                "hook": "string",
+                "premise": "string",
+                "escalations": ["string", "string", "string"],
+                "cta": "string"
+            }
+        ]
+    }
+
     user_prompt = (
-        f"CONTEXT:\n{ctx}\n\n"
+        "You are Happy Face Ads’ writers-room engine. "
+        "Style: bold, absurd, against-the-grain, big swings, often faceless.\n\n"
+        f"CONTEXT (snippets from our library):\n{ctx}\n\n"
         f"INPUTS:\nIndustry: {req.industry}\nService: {req.service}\nAudience: {req.audience}\n"
-        f"Levers: {req.levers}\n"
-        "Produce {n} numbered concepts. Each with Hook, Premise, 3 Escalations, CTA."
-    ).format(n=req.n)
+        f"Levers: {', '.join(req.levers)}\n\n"
+        f"Return EXACTLY this JSON shape (no extra keys), with {req.n} items:\n"
+        f"{json.dumps(schema_hint, indent=2)}"
+    )
 
     chat = client.chat.completions.create(
         model=GEN_MODEL,
         messages=[
-            {"role": "system", "content": "You are Happy Face Ads’ writers-room engine. Bold, absurd, against-the-grain, comedic."},
+            {"role": "system", "content": "Return only valid JSON. No markdown, no commentary."},
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.9,
+        response_format={"type": "json_object"},
     )
-    text = chat.choices[0].message.content
 
-    # save the brief
+    # 4) Parse JSON safely
+    raw = chat.choices[0].message.content
+    try:
+        data = json.loads(raw)
+        concepts = data.get("concepts", [])
+    except Exception:
+        concepts = []
+
+    # 5) Also save a markdown version for history
+    def to_md(c, i):
+        title = c.get("title") or f"Concept {i+1}"
+        esc = "\n".join([f"- {e}" for e in c.get("escalations", [])])
+        return (
+            f"### {title}\n"
+            f"1. **Hook**: {c.get('hook','')}\n"
+            f"2. **Premise**: {c.get('premise','')}\n"
+            f"3. **Escalations**:\n{esc}\n"
+            f"4. **CTA**: {c.get('cta','')}\n"
+        )
+    markdown = "\n\n".join([to_md(c, i) for i, c in enumerate(concepts)])
+
     with get_conn() as conn, conn.transaction():
         brief = conn.execute(
             "insert into briefs(inputs, output_md) values (%s,%s) returning id",
-            (json.dumps(req.dict()), text),
+            (json.dumps(req.dict()), markdown),
         ).fetchone()
 
-    return {"brief_id": brief["id"], "markdown": text}
+    return {"brief_id": brief["id"], "concepts": concepts, "markdown": markdown}
 
 @app.post("/generate/rewrite")
 def generate_rewrite(req: RewriteReq):
