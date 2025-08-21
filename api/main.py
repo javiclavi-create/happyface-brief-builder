@@ -24,10 +24,10 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, "*"],
-    allow_credentials=True,
+    allow_origins=["*"],   # allow any site for now (we'll lock down later)
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=False  # must be False when using "*"
 )
 
 # ----- DB helper -----
