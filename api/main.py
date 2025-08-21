@@ -33,7 +33,7 @@ app.add_middleware(
 # ----- DB helper -----
 def get_conn():
     conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-    register_vector(conn)  # enables passing Python lists into pgvector columns
+    register_vector(conn)  # important: enable pgvector on this connection
     return conn
 
 # ----- Request bodies from the site -----
