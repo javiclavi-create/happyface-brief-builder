@@ -7,3 +7,29 @@ body { @apply bg-neutral-950 text-neutral-100; }
 .btn { @apply px-4 py-2 rounded-lg border border-neutral-700 hover:bg-neutral-800; }
 .input { @apply w-full p-3 rounded-lg bg-neutral-900 border border-neutral-800; }
 .label { @apply text-sm text-neutral-400; }
+/* subtle glass card + gradient border vibe */
+.card-pro {
+  position: relative;
+  border-radius: 1rem; /* 16px */
+  padding: 1.25rem;    /* 20px */
+  background: rgba(16,16,16,0.7);
+  border: 1px solid rgba(120,120,120,0.18);
+  backdrop-filter: blur(6px);
+}
+.card-pro::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 1rem;
+  padding: 1px;
+  background: linear-gradient(135deg, rgba(255,255,255,.12), rgba(255,255,255,.02));
+  -webkit-mask: 
+    linear-gradient(#000 0 0) content-box, 
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask-composite: exclude;
+  pointer-events: none;
+}
+.badge {
+  @apply inline-flex items-center px-2 py-1 text-xs rounded-full border border-neutral-700;
+}
