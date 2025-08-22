@@ -44,6 +44,7 @@ class IngestText(BaseModel):
     hold_rate: Optional[float] = None
     cpl: Optional[float] = None
     link_clicks: Optional[int] = None
+    spend: Optional[float] = None  # <<< NEW
 
 class GenerateReq(BaseModel):
     brand_id: Optional[str] = None
@@ -97,6 +98,7 @@ def ingest_text(req: IngestText):
             "hold_rate": req.hold_rate,
             "cpl": req.cpl,
             "link_clicks": req.link_clicks,
+            "spend": req.spend,  # <<< NEW
         }.items() if v is not None
     }
     meta = {"style_tags": req.style_tags or [], "metrics": metrics}
