@@ -2,19 +2,14 @@
 @tailwind components;
 @tailwind utilities;
 
-:root { color-scheme: dark; --happy-yellow: #f9d600; }
+:root { color-scheme: dark; --hf-yellow: #f9d600; }
+
 body { @apply bg-neutral-950 text-neutral-100; }
 .card { @apply border border-neutral-800 rounded-2xl p-5; }
-.btn { @apply px-4 py-2 rounded-lg border border-neutral-700 hover:bg-neutral-800 transition; }
-.btn-selected { background: var(--happy-yellow); color: #111; border-color: var(--happy-yellow); }
+.btn { @apply px-4 py-2 rounded-lg border border-neutral-700 hover:bg-neutral-800; }
 .input { @apply w-full p-3 rounded-lg bg-neutral-900 border border-neutral-800; }
 .label { @apply text-sm text-neutral-400; }
-.badge { @apply inline-flex items-center gap-2 px-3 py-1 rounded-full border border-neutral-700 text-sm; }
-/* Happy Face Yellow styles */
-.btn-selected { background: #f9d600; color: #111; border-color: #f9d600; }
+
 .chip { @apply px-3 py-1 rounded-full border border-neutral-700 text-sm; }
-.chip-selected { background: #f9d600; color: #111; border-color: #f9d600; }
-.grid-metrics { @apply grid grid-cols-2 md:grid-cols-3 gap-2; }
-.metric { @apply text-xs text-neutral-400; }
-.metric b { @apply text-neutral-100; }
-.badge { @apply text-xs px-2 py-0.5 rounded-full border border-neutral-700; }
+.chip-selected { background: var(--hf-yellow); color: #111; border-color: var(--hf-yellow); }
+
