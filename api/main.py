@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg
 from psycopg.rows import dict_row
-from pgvector.psycopg import register_vector
+from pgvector.psycopg import register_vector, Vector   # <-- IMPORTANT
 from openai import OpenAI
 
 # --- Env ---
@@ -42,8 +42,7 @@ app.add_middleware(
 # --- DB helper ---
 def get_conn():
     conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-    # IMPORTANT: teach psycopg how to handle pgvector <-> Python lists
-    register_vector(conn)
+    register_vector(conn)  # register pgvector adapter for this connection
     return conn
 
 # --- Small utils ---
@@ -58,8 +57,7 @@ def chunk_text(txt: str, max_chars: int = 2500, overlap: int = 250):
         end = min(len(txt), start + max_chars)
         chunks.append(txt[start:end])
         start = end - overlap
-        if start < 0:
-            start = 0
+        if start < 0: start = 0
     return chunks
 
 def embed(texts: List[str]) -> List[List[float]]:
@@ -73,7 +71,6 @@ def dict_clean(d: Dict[str, Any]) -> Dict[str, Any]:
 
 # --- Models for generation ---
 class GenerateReq(BaseModel):
-    # new fields
     project_type: str  # "product" or "service"
     ad_type: str       # "static" or "video"
     industry: str
@@ -106,24 +103,12 @@ def describe_image(public_url: str) -> str:
             model=GEN_MODEL,
             temperature=0.2,
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a sharp creative director describing ad visuals.",
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Describe the visual style, tone, on-screen text, props, layout, and color palette.",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": public_url},
-                        },
-                    ],
-                },
-            ],
+                {"role": "system", "content": "You are a sharp creative director describing ad visuals."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Describe the visual style, tone, on-screen text, props, layout, and color palette."},
+                    {"type": "image_url", "image_url": {"url": public_url}}
+                ]}
+            ]
         )
         return (msg.choices[0].message.content or "").strip()
     except Exception:
@@ -154,62 +139,34 @@ def ingest_text(
     if source_type not in ("internal", "inspo"):
         raise HTTPException(400, "source_type must be 'internal' or 'inspo'")
 
-    metrics = dict_clean(
-        {
-            "hook_rate": hook_rate,
-            "hold_rate": hold_rate,
-            "cpm": cpm,
-            "cpl": cpl,
-            "link_clicks": link_clicks,
-            "spend": spend,
-        }
-    )
+    metrics = dict_clean({
+        "hook_rate": hook_rate, "hold_rate": hold_rate, "cpm": cpm,
+        "cpl": cpl, "link_clicks": link_clicks, "spend": spend
+    })
 
-    # Build the text body the model will learn from
-    full_text = (
-        f"TITLE: {title}\n"
-        f"URL: {url or ''}\n"
-        f"MEDIA_KIND: {media_kind or ''}\n"
-        f"CONTENT_STYLE: {content_style or ''}\n"
-        f"METRICS: {json.dumps(metrics)}\n\n"
-        f"{text}"
-    ).strip()
-
+    full_text = f"TITLE: {title}\nURL: {url or ''}\nMEDIA_KIND: {media_kind or ''}\nCONTENT_STYLE: {content_style or ''}\nMETRICS: {json.dumps(metrics)}\n\n{text}".strip()
     chunks = chunk_text(full_text)
     vecs = embed(chunks)
 
     with get_conn() as conn, conn.transaction():
         doc = conn.execute(
-            """
-            insert into documents(brand_id, source_type, title, url, text_content, media_kind, metadata)
-            values (%s,%s,%s,%s,%s,%s,%s)
-            returning id
-            """,
-            (
-                brand_id,
-                source_type,
-                title,
-                url,
-                full_text,
-                media_kind,
-                json.dumps(dict_clean({"content_style": content_style, "metrics": metrics})),
-            ),
+            """insert into documents(brand_id, source_type, title, url, text_content, media_kind, metadata)
+               values (%s,%s,%s,%s,%s,%s,%s) returning id""",
+            (brand_id, source_type, title, url, full_text, media_kind, json.dumps(dict_clean({"content_style":content_style, "metrics":metrics})))
         ).fetchone()
-
         for i, (chunk, v) in enumerate(zip(chunks, vecs)):
             conn.execute(
                 "insert into embeddings(doc_id, chunk_idx, text_chunk, embedding) values (%s,%s,%s,%s)",
-                (doc["id"], i, chunk, v),  # pass list directly
+                (doc["id"], i, chunk, Vector(v))   # <-- IMPORTANT
             )
-
     return {"status": "ok", "chunks": len(chunks)}
 
 # 2) Ingest with optional file (image or video) + optional link + metrics
 @app.post("/ingest/media")
 async def ingest_media(
     title: str = Form(...),
-    source_type: str = Form(...),  # 'internal' | 'inspo'
-    media_kind: str = Form(...),  # 'static' | 'video'
+    source_type: str = Form(...),    # 'internal' | 'inspo'
+    media_kind: str = Form(...),     # 'static' | 'video'
     brand_id: Optional[str] = Form(None),
     url: Optional[str] = Form(None),
     content_style: Optional[str] = Form(None),
@@ -229,35 +186,25 @@ async def ingest_media(
     public_url = None
     media_mime = None
 
-    # Upload file to Supabase Storage if provided
     if file and supabase:
         media_mime = file.content_type or ""
         path = f"uploads/{uuid.uuid4()}/{file.filename}"
         data = await file.read()
-        upload = supabase.storage.from_(BUCKET).upload(
-            path, data, {"content-type": media_mime, "upsert": False}
-        )
+        upload = supabase.storage.from_(BUCKET).upload(path, data, {"content-type": media_mime, "upsert": False})
         if upload is not None and getattr(upload, "error", None):
             raise HTTPException(500, f"Storage error: {upload.error}")
         public_url = supabase.storage.from_(BUCKET).get_public_url(path)
     else:
-        public_url = url  # may be None; that’s ok
+        public_url = url
 
-    # If it's an image we can "see", describe it to enrich training text
     visual_desc = ""
     if media_kind == "static" and public_url:
-        visual_desc = describe_image(public_url) or ""
+        visual_desc = describe_image(public_url)
 
-    metrics = dict_clean(
-        {
-            "hook_rate": hook_rate,
-            "hold_rate": hold_rate,
-            "cpm": cpm,
-            "cpl": cpl,
-            "link_clicks": link_clicks,
-            "spend": spend,
-        }
-    )
+    metrics = dict_clean({
+        "hook_rate": hook_rate, "hold_rate": hold_rate, "cpm": cpm,
+        "cpl": cpl, "link_clicks": link_clicks, "spend": spend
+    })
 
     base_lines = [
         f"TITLE: {title}",
@@ -274,28 +221,15 @@ async def ingest_media(
 
     with get_conn() as conn, conn.transaction():
         doc = conn.execute(
-            """
-            insert into documents(brand_id, source_type, title, url, text_content, media_kind, media_mime, media_url, metadata)
-            values (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            returning id
-            """,
-            (
-                brand_id,
-                source_type,
-                title,
-                public_url,
-                full_text,
-                media_kind,
-                media_mime,
-                public_url,
-                json.dumps(dict_clean({"content_style": content_style, "metrics": metrics})),
-            ),
+            """insert into documents(brand_id, source_type, title, url, text_content, media_kind, media_mime, media_url, metadata)
+               values (%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id""",
+            (brand_id, source_type, title, public_url, full_text, media_kind, media_mime, public_url,
+             json.dumps(dict_clean({"content_style": content_style, "metrics": metrics})))
         ).fetchone()
-
         for i, (chunk, v) in enumerate(zip(chunks, vecs)):
             conn.execute(
                 "insert into embeddings(doc_id, chunk_idx, text_chunk, embedding) values (%s,%s,%s,%s)",
-                (doc["id"], i, chunk, v),  # pass list directly
+                (doc["id"], i, chunk, Vector(v))   # <-- IMPORTANT
             )
 
     return {"status": "ok", "chunks": len(chunks), "url": public_url}
@@ -303,52 +237,37 @@ async def ingest_media(
 # 3) Generate concepts (BIG swings, 10/10 funny)
 @app.post("/generate/concepts")
 def generate_concepts(req: GenerateReq):
-    # Build a short query for retrieval
     fields = [
-        req.project_type,
-        req.ad_type,
-        req.industry,
-        req.audience,
+        req.project_type, req.ad_type, req.industry, req.audience,
         " ".join(req.platforms or []),
         " ".join(req.content_style or []),
         " ".join(req.levers or []),
-        (req.product_name or ""),
-        (req.what_it_does or ""),
-        (req.service or ""),
+        (req.product_name or ""), (req.what_it_does or ""), (req.service or "")
     ]
     q = " | ".join([f for f in fields if f])
 
-    # nearest neighbors from internal + inspo
     q_vec = embed([q])[0]
 
     with get_conn() as conn:
         internal = conn.execute(
-            """
-            select text_chunk
-            from embeddings e
-            join documents d on d.id = e.doc_id
-            where d.source_type = 'internal'
-            order by e.embedding <=> %s
-            limit 8
-            """,
-            (q_vec,),
+            """select text_chunk from embeddings e
+               join documents d on d.id = e.doc_id
+               where d.source_type = 'internal'
+               order by e.embedding <=> %s
+               limit 8""",
+            (Vector(q_vec),)   # <-- IMPORTANT
         ).fetchall()
-
         inspo = conn.execute(
-            """
-            select text_chunk
-            from embeddings e
-            join documents d on d.id = e.doc_id
-            where d.source_type = 'inspo'
-            order by e.embedding <=> %s
-            limit 4
-            """,
-            (q_vec,),
+            """select text_chunk from embeddings e
+               join documents d on d.id = e.doc_id
+               where d.source_type = 'inspo'
+               order by e.embedding <=> %s
+               limit 4""",
+            (Vector(q_vec),)   # <-- IMPORTANT
         ).fetchall()
 
     ctx = "\n\n".join([r["text_chunk"] for r in (internal + inspo)]) or "No prior docs yet."
 
-    # Force JSON so frontend can render cards cleanly
     system = (
         "You are Happy Face Ads’ writers-room engine. Always swing HUGE (10/10 absurdity), "
         "against the grain, bold, deadpan where funny. Keep ideas producible."
@@ -364,9 +283,9 @@ def generate_concepts(req: GenerateReq):
         model=GEN_MODEL,
         temperature=0.95,
         messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(user)},
-        ],
+            {"role":"system","content": system},
+            {"role":"user","content": json.dumps(user)}
+        ]
     )
 
     raw = chat.choices[0].message.content or "{}"
@@ -374,21 +293,17 @@ def generate_concepts(req: GenerateReq):
         parsed = json.loads(raw)
         concepts = parsed.get("concepts", [])
     except Exception:
-        # fallback: one safe concept if parsing failed
-        concepts = [
-            {
-                "hook": "A totally unexpected cold open that subverts the product category",
-                "premise": "Lean into an absurd premise that still showcases the product/service benefit",
-                "escalations": ["Beat 1 gets weirder", "Beat 2 doubles the bit", "Beat 3 flips POV"],
-                "cta": "Direct, punchy ask tailored to platform",
-            }
-        ]
+        concepts = [{
+            "hook":"A totally unexpected cold open that subverts the product category",
+            "premise":"Lean into an absurd premise that still showcases the product/service benefit",
+            "escalations":["Beat 1 gets weirder","Beat 2 doubles the bit","Beat 3 flips POV"],
+            "cta":"Direct, punchy ask tailored to platform"
+        }]
 
-    # Also keep the raw for backward compatibility
     with get_conn() as conn, conn.transaction():
         brief = conn.execute(
             "insert into briefs(inputs, output_md) values (%s,%s) returning id",
-            (json.dumps(req.dict()), raw),
+            (json.dumps(req.dict()), raw)
         ).fetchone()
 
     return {"brief_id": brief["id"], "concepts": concepts, "markdown": raw}
@@ -404,9 +319,9 @@ def generate_rewrite(req: RewriteReq):
         model=GEN_MODEL,
         temperature=0.8,
         messages=[
-            {"role": "system", "content": "You are Happy Face Ads’ rewrite engine. Keep it tight, punchy, shootable."},
-            {"role": "user", "content": json.dumps(prompt)},
-        ],
+            {"role":"system","content":"You are Happy Face Ads’ rewrite engine. Keep it tight, punchy, shootable."},
+            {"role":"user","content": json.dumps(prompt)}
+        ]
     )
     return {"script": chat.choices[0].message.content}
 
@@ -424,9 +339,9 @@ def generate_rewrite_batch(req: RewriteBatchReq):
             model=GEN_MODEL,
             temperature=0.8,
             messages=[
-                {"role": "system", "content": "You are Happy Face Ads’ rewrite engine. Keep it tight, punchy, shootable."},
-                {"role": "user", "content": json.dumps(prompt)},
-            ],
+                {"role":"system","content":"You are Happy Face Ads’ rewrite engine. Keep it tight, punchy, shootable."},
+                {"role":"user","content": json.dumps(prompt)}
+            ]
         )
         scripts.append(chat.choices[0].message.content)
     return {"scripts": scripts}
