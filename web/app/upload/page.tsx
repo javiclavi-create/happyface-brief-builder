@@ -1,79 +1,100 @@
 'use client';
-import React, { useState } from 'react';
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8000';
+import { useState } from 'react';
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
 
-export default function Upload() {
-  const [title, setTitle] = useState('');
-  const [sourceType, setSourceType] = useState<'internal' | 'inspo'>('internal');
-  const [text, setText] = useState('');
-  const [url, setUrl] = useState('');
-  const [status, setStatus] = useState('');
+const STYLE_OPTIONS = ['deadpan','absurd','mockumentary','surreal','infomercial-parody'];
 
-  async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
+export default function Upload(){
+  const [title,setTitle] = useState('');
+  const [sourceType,setSourceType] = useState<'internal'|'inspo'>('internal');
+  const [text,setText] = useState('');
+  const [url,setUrl] = useState('');
+  const [status,setStatus] = useState('');
+  const [styleTags,setStyleTags] = useState<string[]>([]);
+  const [addPerf,setAddPerf] = useState(false);
+  const [metrics,setMetrics] = useState({ hook_rate:'', cpm:'', hold_rate:'', cpl:'', link_clicks:'' });
+
+  const toggleStyle = (t:string)=> setStyleTags(s => s.includes(t)? s.filter(x=>x!==t): [...s,t]);
+
+  async function onSubmit(e:any){
     e.preventDefault();
     setStatus('Uploading…');
-    try {
-      const res = await fetch(`${API_BASE}/ingest/text`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, text, source_type: sourceType, url }),
-      });
-      if (!res.ok) {
-        const t = await res.text();
-        throw new Error(`API ${res.status}: ${t}`);
-      }
-      const json = await res.json();
-      setStatus(`✅ Done. Chunks: ${json.chunks}`);
-    } catch (e: any) {
-      setStatus(`⚠️ ${e?.message || String(e)}`);
+    const body:any = { title, text, source_type: sourceType, url, style_tags: styleTags };
+    if(addPerf && sourceType==='internal'){
+      body.hook_rate   = metrics.hook_rate   ? Number(metrics.hook_rate)   : undefined;
+      body.cpm         = metrics.cpm         ? Number(metrics.cpm)         : undefined;
+      body.hold_rate   = metrics.hold_rate   ? Number(metrics.hold_rate)   : undefined;
+      body.cpl         = metrics.cpl         ? Number(metrics.cpl)         : undefined;
+      body.link_clicks = metrics.link_clicks ? Number(metrics.link_clicks) : undefined;
     }
+    const res = await fetch(`${API_BASE}/ingest/text`,{
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    if(!res.ok){ setStatus('❌ Failed'); return; }
+    const json = await res.json();
+    setStatus(`✅ Done. Chunks: ${json.chunks}`);
+    setTitle(''); setText(''); setUrl('');
+    setMetrics({ hook_rate:'', cpm:'', hold_rate:'', cpl:'', link_clicks:'' });
+    setStyleTags([]); setAddPerf(false);
   }
 
   return (
     <main className="space-y-6">
       <section className="card space-y-4">
         <h2 className="text-xl font-medium">Upload to Library</h2>
-        <form onSubmit={onSubmit} className="space-y-3">
+        <form className="space-y-4" onSubmit={onSubmit}>
           <div>
             <label className="label">Title</label>
-            <input className="input" value={title} onChange={(e) => setTitle(e.target.value)} />
+            <input className="input" value={title} onChange={e=>setTitle(e.target.value)} />
           </div>
+
+          <div className="flex gap-3 items-center">
+            <span className="label">Source type</span>
+            <button type="button" className={`btn ${sourceType==='internal'?'btn-selected':''}`} onClick={()=>setSourceType('internal')}>internal</button>
+            <button type="button" className={`btn ${sourceType==='inspo'?'btn-selected':''}`} onClick={()=>setSourceType('inspo')}>inspo</button>
+          </div>
+
           <div>
-            <label className="label">Source type</label>
-            <div className="flex gap-2 mt-2">
-              {(['internal', 'inspo'] as const).map((t) => (
-                <button
-                  type="button"
-                  key={t}
-                  onClick={() => setSourceType(t)}
-                  className={`btn ${sourceType === t ? 'bg-neutral-800' : ''}`}
-                >
-                  {t}
-                </button>
+            <label className="label">Optional URL (link to the ad)</label>
+            <input className="input" value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://…" />
+          </div>
+
+          <div>
+            <label className="label">Style tags</label>
+            <div className="flex flex-wrap gap-2 mt-2">
+              {STYLE_OPTIONS.map(t=> (
+                <button key={t} type="button" className={`btn ${styleTags.includes(t)?'btn-selected':''}`} onClick={()=>toggleStyle(t)}>{t}</button>
               ))}
             </div>
           </div>
+
           <div>
-            <label className="label">Optional URL</label>
-            <input
-              className="input"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              placeholder="https://…"
-            />
+            <label className="label">Text (script / transcript)</label>
+            <textarea className="input h-60" value={text} onChange={e=>setText(e.target.value)} placeholder="Paste the script or transcript…" />
           </div>
-          <div>
-            <label className="label">Text</label>
-            <textarea
-              className="input h-60"
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-              placeholder="Paste script/brief/article…"
-            ></textarea>
+
+          {sourceType==='internal' && (
+            <div className="space-y-3">
+              <div className="flex items-center gap-3">
+                <input id="perf" type="checkbox" checked={addPerf} onChange={e=>setAddPerf(e.target.checked)} />
+                <label htmlFor="perf" className="label">Add performance data?</label>
+              </div>
+              {addPerf && (
+                <div className="grid md:grid-cols-3 gap-3">
+                  <div><label className="label">Hook Rate %</label><input className="input" value={metrics.hook_rate} onChange={e=>setMetrics({...metrics, hook_rate:e.target.value})} placeholder="e.g. 28" /></div>
+                  <div><label className="label">Hold Rate %</label><input className="input" value={metrics.hold_rate} onChange={e=>setMetrics({...metrics, hold_rate:e.target.value})} placeholder="e.g. 12" /></div>
+                  <div><label className="label">CPM</label><input className="input" value={metrics.cpm} onChange={e=>setMetrics({...metrics, cpm:e.target.value})} placeholder="e.g. 5.30" /></div>
+                  <div><label className="label">CPL</label><input className="input" value={metrics.cpl} onChange={e=>setMetrics({...metrics, cpl:e.target.value})} placeholder="e.g. 7.90" /></div>
+                  <div><label className="label">Link Clicks</label><input className="input" value={metrics.link_clicks} onChange={e=>setMetrics({...metrics, link_clicks:e.target.value})} placeholder="e.g. 124" /></div>
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="flex items-center gap-3">
+            <button className="btn btn-selected" type="submit">Ingest</button>
+            <div className="text-sm text-neutral-400">{status}</div>
           </div>
-          <button className="btn" type="submit">Ingest</button>
-          {status && <p className="text-sm text-neutral-400">{status}</p>}
-          <p className="text-xs text-neutral-500">API base: {API_BASE}</p>
         </form>
       </section>
     </main>
