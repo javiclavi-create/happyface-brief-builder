@@ -6,7 +6,6 @@ from pydantic import BaseModel
 import psycopg
 from psycopg.rows import dict_row
 from pgvector.psycopg import register_vector
-from pgvector import Vector
 from openai import OpenAI
 
 # --- Env ---
@@ -253,7 +252,7 @@ def generate_concepts(req: GenerateReq):
     q = " | ".join([f for f in fields if f])
 
     # nearest neighbors from internal + inspo
-    q_vec = Vector(embed([q])[0])
+    q_vec = embed([q])[0]
 
     with get_conn() as conn:
         internal = conn.execute(
