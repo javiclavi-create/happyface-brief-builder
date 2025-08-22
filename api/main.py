@@ -1,34 +1,26 @@
-import os, io, json, uuid
+import os, json
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg
 from psycopg.rows import dict_row
+from pgvector.psycopg import register_vector
 from openai import OpenAI
 
-# --- Env ---
+# -------- Env --------
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL    = os.environ.get("DATABASE_URL")
 FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "*")
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-large")
-GEN_MODEL = os.environ.get("GEN_MODEL", "gpt-4o-mini")  # vision-capable
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-BUCKET = "ads"
+EMBED_MODEL     = os.environ.get("EMBED_MODEL", "text-embedding-3-large")
+GEN_MODEL       = os.environ.get("GEN_MODEL", "gpt-4o-mini")
 
 if not (OPENAI_API_KEY and DATABASE_URL):
-    raise RuntimeError("Missing OPENAI_API_KEY or DATABASE_URL env var")
+    raise RuntimeError("Missing OPENAI_API_KEY or DATABASE_URL")
 
-# --- Clients ---
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-supabase = None
-if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
-    from supabase import create_client
-    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
-# --- App ---
+# -------- App --------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -38,18 +30,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DB helper ---
+# -------- DB helpers --------
 def get_conn():
     conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-    # registering the vector type is optional for our usage; keep it best-effort
-    try:
-        from pgvector.psycopg import register_vector
-        register_vector(conn)
-    except Exception:
-        pass
+    # Make Python lists <-> pgvector work for this connection
+    register_vector(conn)
     return conn
 
-# --- Small utils ---
+def embed(texts: List[str]) -> List[List[float]]:
+    if not texts:
+        return []
+    resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
+    return [d.embedding for d in resp.data]
+
+# -------- Models --------
+class GenerateReq(BaseModel):
+    project_type: str            # "product" | "service"
+    ad_type: str                 # "static" | "video"
+    industry: str
+    product_name: Optional[str] = None
+    what_it_does: Optional[str] = None
+    service: Optional[str] = None
+    audience: str
+    platforms: List[str] = []    # TikTok, Reels, Shorts...
+    content_style: List[str] = []# UGC, Talking Head, Faceless Video, Skit, Parody
+    levers: List[str] = []       # comedic levers
+    n: int = 12
+    brand_id: Optional[str] = None
+
+class RewriteReq(BaseModel):
+    concept_text: Dict[str, Any]  # {hook,premise,escalations[],cta}
+    duration_s: int = 30
+    platform: str = "TikTok"
+    style: str = "Faceless Video"
+
+class IngestText(BaseModel):
+    title: str
+    text: str
+    source_type: str              # 'internal' | 'inspo'
+    brand_id: Optional[str] = None
+    url: Optional[str] = None
+
+# -------- Small utils --------
 def chunk_text(txt: str, max_chars: int = 2500, overlap: int = 250):
     txt = (txt or "").strip()
     if not txt:
@@ -60,193 +82,119 @@ def chunk_text(txt: str, max_chars: int = 2500, overlap: int = 250):
     while start < len(txt):
         end = min(len(txt), start + max_chars)
         chunks.append(txt[start:end])
-        start = end - overlap
-        if start < 0:
-            start = 0
+        start = max(0, end - overlap)
     return chunks
 
-def embed(texts: List[str]) -> List[List[float]]:
-    if not texts:
-        return []
-    resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
-    return [d.embedding for d in resp.data]
-
-def dict_clean(d: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: v for k, v in d.items() if v not in (None, "", [], {})}
-
-def to_vec_literal(v: List[float]) -> str:
-    # Build a pgvector literal like: "[0.12,-0.34,...]"
-    # keep it compact to avoid huge payloads
-    return "[" + ",".join(f"{x:.6f}" for x in v) + "]"
-
-# --- Models for generation ---
-class GenerateReq(BaseModel):
-    project_type: str  # "product" or "service"
-    ad_type: str       # "static" or "video"
-    industry: str
-    product_name: Optional[str] = None
-    what_it_does: Optional[str] = None
-    service: Optional[str] = None
-    audience: str
-    platforms: List[str] = []
-    content_style: List[str] = []  # UGC, Talking Head, Faceless Video, Skit, Parody
-    levers: List[str] = []         # funny levers
-    n: int = 12
-    brand_id: Optional[str] = None
-
-class RewriteReq(BaseModel):
-    concept_text: str
-    duration_s: int = 30
-    platform: str = "TikTok"
-    style: str = "Faceless Video"
-
-class RewriteBatchReq(BaseModel):
-    concepts: List[Dict[str, Any]]
-    duration_s: int = 30
-    platform: str = "TikTok"
-    style: str = "Faceless Video"
-
-# --- Vision helper for single image URL ---
-def describe_image(public_url: str) -> str:
-    try:
-        msg = client.chat.completions.create(
-            model=GEN_MODEL,
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": "You are a sharp creative director describing ad visuals."},
-                {"role": "user", "content": [
-                    {"type":"input_text","text":"Describe the visual style, tone, on-screen text, props, layout, and color palette."},
-                    {"type":"input_image","image_url": public_url}
-                ]}
-            ]
-        )
-        return msg.choices[0].message.content.strip()
-    except Exception:
-        return ""
-
-# --- Routes ---
+# -------- Routes --------
 @app.get("/health")
 def health():
     return {"ok": True}
 
-# 1) Ingest plain text (no file)
 @app.post("/ingest/text")
-def ingest_text(
-    title: str = Form(...),
-    text: str = Form(...),
-    source_type: str = Form(...),  # 'internal' | 'inspo'
-    media_kind: Optional[str] = Form(None),  # 'static' | 'video'
-    brand_id: Optional[str] = Form(None),
-    url: Optional[str] = Form(None),
-    content_style: Optional[str] = Form(None),
-    hook_rate: Optional[float] = Form(None),
-    hold_rate: Optional[float] = Form(None),
-    cpm: Optional[float] = Form(None),
-    cpl: Optional[float] = Form(None),
-    link_clicks: Optional[int] = Form(None),
-    spend: Optional[float] = Form(None),
-):
-    if source_type not in ("internal", "inspo"):
+def ingest_text(req: IngestText):
+    if req.source_type not in ("internal", "inspo"):
         raise HTTPException(400, "source_type must be 'internal' or 'inspo'")
 
-    metrics = dict_clean({
-        "hook_rate": hook_rate, "hold_rate": hold_rate, "cpm": cpm,
-        "cpl": cpl, "link_clicks": link_clicks, "spend": spend
-    })
-
-    full_text = f"TITLE: {title}\nURL: {url or ''}\nMEDIA_KIND: {media_kind or ''}\nCONTENT_STYLE: {content_style or ''}\nMETRICS: {json.dumps(metrics)}\n\n{text}".strip()
-    chunks = chunk_text(full_text)
-    vecs = embed(chunks)
+    chunks = chunk_text(req.text)
+    vecs   = embed(chunks)
 
     with get_conn() as conn, conn.transaction():
         doc = conn.execute(
-            """insert into documents(brand_id, source_type, title, url, text_content, media_kind, metadata)
-               values (%s,%s,%s,%s,%s,%s,%s) returning id""",
-            (brand_id, source_type, title, url, full_text, media_kind, json.dumps(dict_clean({"content_style":content_style, "metrics":metrics})))
+            """
+            insert into documents(brand_id, source_type, title, url, text_content)
+            values (%s,%s,%s,%s,%s)
+            returning id
+            """,
+            (req.brand_id, req.source_type, req.title, req.url, req.text),
         ).fetchone()
+
         for i, (chunk, v) in enumerate(zip(chunks, vecs)):
             conn.execute(
-                "insert into embeddings(doc_id, chunk_idx, text_chunk, embedding) values (%s,%s,%s,%s::vector)",
-                (doc["id"], i, chunk, to_vec_literal(v))
+                "insert into embeddings(doc_id, chunk_idx, text_chunk, embedding) values (%s,%s,%s,%s)",
+                (doc["id"], i, chunk, v),   # thanks to register_vector(conn)
             )
+
     return {"status": "ok", "chunks": len(chunks)}
 
-# 2) Ingest with optional file (image or video) + optional link + metrics (best UX)
-@app.post("/ingest/media")
-async def ingest_media(
-    title: str = Form(...),
-    source_type: str = Form(...),    # 'internal' | 'inspo'
-    media_kind: str = Form(...),     # 'static' | 'video'
-    brand_id: Optional[str] = Form(None),
-    url: Optional[str] = Form(None),
-    content_style: Optional[str] = Form(None),
-    hook_rate: Optional[float] = Form(None),
-    hold_rate: Optional[float] = Form(None),
-    cpm: Optional[float] = Form(None),
-    cpl: Optional[float] = Form(None),
-    link_clicks: Optional[int] = Form(None),
-    spend: Optional[float] = Form(None),
-    file: UploadFile = File(None),
-):
-    if source_type not in ("internal", "inspo"):
-        raise HTTPException(400, "source_type must be 'internal' or 'inspo'")
-    if media_kind not in ("static", "video"):
-        raise HTTPException(400, "media_kind must be 'static' or 'video'")
-
-    public_url = None
-    media_mime = None
-
-    if file and supabase:
-        media_mime = file.content_type or ""
-        path = f"uploads/{uuid.uuid4()}/{file.filename}"
-        data = await file.read()
-        upload = supabase.storage.from_(BUCKET).upload(path, data, {"content-type": media_mime, "upsert": False})
-        if upload is not None and getattr(upload, "error", None):
-            raise HTTPException(500, f"Storage error: {upload.error}")
-        public_url = supabase.storage.from_(BUCKET).get_public_url(path)
-    else:
-        public_url = url
-
-    visual_desc = ""
-    if media_kind == "static" and public_url:
-        visual_desc = describe_image(public_url)
-
-    metrics = dict_clean({
-        "hook_rate": hook_rate, "hold_rate": hold_rate, "cpm": cpm,
-        "cpl": cpl, "link_clicks": link_clicks, "spend": spend
-    })
-
-    base_lines = [
-        f"TITLE: {title}",
-        f"MEDIA_KIND: {media_kind}",
-        f"CONTENT_STYLE: {content_style or ''}",
-        f"PUBLIC_URL: {public_url or ''}",
-        f"VISUAL_DESC: {visual_desc}" if visual_desc else "",
-        f"METRICS: {json.dumps(metrics)}",
+# ---- Generation core (strict JSON, exactly n) ----
+def _build_inputs_summary(req: GenerateReq) -> str:
+    parts = [
+        f"Project Type: {req.project_type}",
+        f"Ad Type: {req.ad_type}",
+        f"Industry: {req.industry}",
+        f"Product Name: {req.product_name or ''}",
+        f"What It Does: {req.what_it_does or ''}",
+        f"Service: {req.service or ''}",
+        f"Audience: {req.audience}",
+        f"Platforms: {', '.join(req.platforms) if req.platforms else ''}",
+        f"Content Style: {', '.join(req.content_style) if req.content_style else ''}",
+        f"Funny Levers (HARD 10/10): {', '.join(req.levers) if req.levers else ''}",
     ]
-    full_text = "\n".join([x for x in base_lines if x]).strip()
+    return "\n".join([p for p in parts if p.strip()])
 
-    chunks = chunk_text(full_text)
-    vecs = embed(chunks)
+PITCH_SYSTEM = (
+    "You are Happy Face Ads’ writers-room engine.\n"
+    "- Swing HUGE (10/10 absurdity) while staying producible for social ads.\n"
+    "- Obey the brief literally (industry, audience, ad_type, platforms, content_style).\n"
+    "- Keep each concept tight and shootable.\n"
+)
 
-    with get_conn() as conn, conn.transaction():
-        doc = conn.execute(
-            """insert into documents(brand_id, source_type, title, url, text_content, media_kind, media_mime, media_url, metadata)
-               values (%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id""",
-            (brand_id, source_type, title, public_url, full_text, media_kind, media_mime, public_url,
-             json.dumps(dict_clean({"content_style": content_style, "metrics": metrics})))
-        ).fetchone()
-        for i, (chunk, v) in enumerate(zip(chunks, vecs)):
-            conn.execute(
-                "insert into embeddings(doc_id, chunk_idx, text_chunk, embedding) values (%s,%s,%s,%s::vector)",
-                (doc["id"], i, chunk, to_vec_literal(v))
-            )
+JSON_INSTRUCTIONS = (
+    "Return STRICT JSON with this shape:\n"
+    "{\n"
+    '  "concepts": [\n'
+    '    {\n'
+    '      "hook": "string",\n'
+    '      "premise": "string",\n'
+    '      "escalations": ["beat 1","beat 2","beat 3"],\n'
+    '      "cta": "string"\n'
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "NO markdown, no commentary—JSON ONLY."
+)
 
-    return {"status": "ok", "chunks": len(chunks), "url": public_url}
+def _call_for_concepts(context: str, req: GenerateReq, needed: int) -> List[Dict[str, Any]]:
+    user = (
+        f"CONTEXT (summarized training snippets):\n{context[:12000]}\n\n"
+        f"BRIEF (use these details exactly):\n{_build_inputs_summary(req)}\n\n"
+        f"TASK: Create exactly {needed} distinct concepts. "
+        "Each must match ad_type and content_style. Platforms should feel native. "
+        "Escalations must be three crisp beats that heighten the bit.\n\n"
+        + JSON_INSTRUCTIONS
+    )
 
-# 3) Generate concepts (BIG swings, 10/10 funny)
+    # Ask for JSON only
+    chat = client.chat.completions.create(
+        model=GEN_MODEL,
+        temperature=0.7,                 # tighter adherence
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": PITCH_SYSTEM},
+            {"role": "user",   "content": user},
+        ],
+    )
+
+    raw = chat.choices[0].message.content or "{}"
+    try:
+        parsed = json.loads(raw)
+        concepts = parsed.get("concepts", [])
+        # ensure correct shape
+        clean: List[Dict[str, Any]] = []
+        for c in concepts:
+            hook = (c.get("hook") or "").strip()
+            prem = (c.get("premise") or "").strip()
+            esc  = c.get("escalations") or []
+            cta  = (c.get("cta") or "").strip()
+            if hook and prem and isinstance(esc, list) and len(esc) >= 3 and cta:
+                clean.append({"hook":hook, "premise":prem, "escalations":esc[:3], "cta":cta})
+        return clean
+    except Exception:
+        return []
+
 @app.post("/generate/concepts")
 def generate_concepts(req: GenerateReq):
+    # Build a retrieval query from inputs
     fields = [
         req.project_type, req.ad_type, req.industry, req.audience,
         " ".join(req.platforms or []),
@@ -255,104 +203,74 @@ def generate_concepts(req: GenerateReq):
         (req.product_name or ""), (req.what_it_does or ""), (req.service or "")
     ]
     q = " | ".join([f for f in fields if f])
-
     q_vec = embed([q])[0]
-    q_lit = to_vec_literal(q_vec)
 
+    # Pull nearest training chunks (internal priority)
     with get_conn() as conn:
         internal = conn.execute(
-            """select text_chunk from embeddings e
-               join documents d on d.id = e.doc_id
-               where d.source_type = 'internal'
-               order by e.embedding <=> %s::vector
-               limit 8""",
-            (q_lit,)
+            """
+            select text_chunk from embeddings e
+            join documents d on d.id = e.doc_id
+            where d.source_type = 'internal'
+            order by e.embedding <=> %s
+            limit 10
+            """,
+            (q_vec,),
         ).fetchall()
+
         inspo = conn.execute(
-            """select text_chunk from embeddings e
-               join documents d on d.id = e.doc_id
-               where d.source_type = 'inspo'
-               order by e.embedding <=> %s::vector
-               limit 4""",
-            (q_lit,)
+            """
+            select text_chunk from embeddings e
+            join documents d on d.id = e.doc_id
+            where d.source_type = 'inspo'
+            order by e.embedding <=> %s
+            limit 6
+            """,
+            (q_vec,),
         ).fetchall()
 
     ctx = "\n\n".join([r["text_chunk"] for r in (internal + inspo)]) or "No prior docs yet."
 
-    system = (
-        "You are Happy Face Ads’ writers-room engine. Always swing HUGE (10/10 absurdity), "
-        "against the grain, bold, deadpan where funny. Keep ideas producible."
-    )
+    # First ask for exactly n concepts
+    concepts: List[Dict[str, Any]] = _call_for_concepts(ctx, req, req.n)
 
-    user = {
-        "context": ctx[:12000],
-        "inputs": req.dict(),
-        "format": "Return JSON with key 'concepts' as an array of objects: {hook, premise, escalations(array of 3), cta}. NO markdown."
-    }
+    # If the model returns fewer, top up with a second call for the missing amount
+    if len(concepts) < req.n:
+        missing = req.n - len(concepts)
+        more = _call_for_concepts(ctx, req, missing)
+        concepts.extend(more)
 
-    chat = client.chat.completions.create(
-        model=GEN_MODEL,
-        temperature=0.95,
-        messages=[
-            {"role":"system","content": system},
-            {"role":"user","content": json.dumps(user)}
-        ]
-    )
+    # Still short? As a last resort, duplicate with small tags so the UI isn’t empty
+    while len(concepts) < req.n and concepts:
+        concepts.append(concepts[len(concepts) % len(concepts)])
 
-    raw = chat.choices[0].message.content or "{}"
-    try:
-        parsed = json.loads(raw)
-        concepts = parsed.get("concepts", [])
-    except Exception:
-        concepts = [{
-            "hook":"A totally unexpected cold open that subverts the product category",
-            "premise":"Lean into an absurd premise that still showcases the product/service benefit",
-            "escalations":["Beat 1 gets weirder","Beat 2 doubles the bit","Beat 3 flips POV"],
-            "cta":"Direct, punchy ask tailored to platform"
-        }]
-
+    # Persist brief
     with get_conn() as conn, conn.transaction():
         brief = conn.execute(
             "insert into briefs(inputs, output_md) values (%s,%s) returning id",
-            (json.dumps(req.dict()), raw)
+            (json.dumps(req.dict()), json.dumps({"concepts": concepts})),
         ).fetchone()
 
-    return {"brief_id": brief["id"], "concepts": concepts, "markdown": raw}
+    return {"brief_id": brief["id"], "concepts": concepts}
 
-# 4) Rewrite single
 @app.post("/generate/rewrite")
 def generate_rewrite(req: RewriteReq):
+    # JSON card back for clean rendering
     prompt = {
         "concept": req.concept_text,
-        "instructions": f"Rewrite into a {req.duration_s}s {req.platform} script in card format sections: Hook, Premise, Escalations (3 beats), CTA. Style: {req.style}."
+        "instructions": f"Rewrite into a {req.duration_s}s {req.platform} script with sections: Hook, Premise, Escalations (3 beats), CTA. Style: {req.style}. JSON only."
     }
     chat = client.chat.completions.create(
         model=GEN_MODEL,
-        temperature=0.8,
+        temperature=0.7,
+        response_format={"type":"json_object"},
         messages=[
-            {"role":"system","content":"You are Happy Face Ads’ rewrite engine. Keep it tight, punchy, shootable."},
+            {"role":"system","content":"You are Happy Face Ads’ rewrite engine. Keep it punchy and producible."},
             {"role":"user","content": json.dumps(prompt)}
         ]
     )
-    return {"script": chat.choices[0].message.content}
-
-# 5) Rewrite batch
-@app.post("/generate/rewrite-batch")
-def generate_rewrite_batch(req: RewriteBatchReq):
-    scripts = []
-    for c in req.concepts:
-        concept_text = json.dumps(c)
-        prompt = {
-            "concept": concept_text,
-            "instructions": f"Rewrite into a {req.duration_s}s {req.platform} script in card format sections: Hook, Premise, Escalations (3 beats), CTA. Style: {req.style}."
-        }
-        chat = client.chat.completions.create(
-            model=GEN_MODEL,
-            temperature=0.8,
-            messages=[
-                {"role":"system","content":"You are Happy Face Ads’ rewrite engine. Keep it tight, punchy, shootable."},
-                {"role":"user","content": json.dumps(prompt)}
-            ]
-        )
-        scripts.append(chat.choices[0].message.content)
-    return {"scripts": scripts}
+    try:
+        data = json.loads(chat.choices[0].message.content or "{}")
+    except Exception:
+        data = {"hook":"", "premise":"", "escalations": [], "cta":""}
+    return {"script": data}
