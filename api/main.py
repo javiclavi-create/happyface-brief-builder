@@ -5,7 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg
 from psycopg.rows import dict_row
-from pgvector.psycopg import register_vector, Vector   # <-- IMPORTANT
+from pgvector.psycopg import register_vector
+from pgvector import Vector
 from openai import OpenAI
 
 # --- Env ---
