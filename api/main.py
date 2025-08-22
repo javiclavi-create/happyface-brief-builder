@@ -1,16 +1,18 @@
 import os
 import json
+import time
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, HttpUrl
 
 import psycopg
 from psycopg.rows import dict_row
 from pgvector.psycopg import register_vector
 
 from openai import OpenAI
+from twelvelabs import TwelveLabs
 
 
 # ============================================================
@@ -20,39 +22,44 @@ from openai import OpenAI
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Frontend origins:
-# - FRONTEND_ORIGINS can be comma-separated list, e.g. "http://localhost:5173,https://myapp.vercel.app"
-# - If unset, we'll allow localhost and any *.vercel.app via regex.
+# Frontend origins (comma-separated). If unset, allow localhost and *.vercel.app via regex.
 FRONTEND_ORIGINS = [
     o.strip()
     for o in os.environ.get("FRONTEND_ORIGINS", "").split(",")
     if o.strip()
 ]
-FRONTEND_ALLOW_VERCEL_WILDCARD = os.environ.get("FRONTEND_ALLOW_VERCEL_WILDCARD", "true").lower() in ("1", "true", "yes")
+FRONTEND_ALLOW_VERCEL_WILDCARD = os.environ.get(
+    "FRONTEND_ALLOW_VERCEL_WILDCARD", "true"
+).lower() in ("1", "true", "yes")
 
 # Embedding/Gen models:
-# Use "text-embedding-3-small" (1536-d) by default to match common DB schema.
+# Default to 1536-d to match common DB schema.
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small")  # 1536
 GEN_MODEL = os.environ.get("GEN_MODEL", "gpt-4o-mini")
 
-# Optional: override embed dimension explicitly (otherwise inferred from model)
-EMBED_DIM_ENV = os.environ.get("EMBED_DIM")  # e.g., "1536" or "3072"
+# Optional dimension override (else inferred from model)
+EMBED_DIM_ENV = os.environ.get("EMBED_DIM")  # "1536" or "3072"
 EMBED_DIM = int(EMBED_DIM_ENV) if EMBED_DIM_ENV else (1536 if "small" in EMBED_MODEL else 3072)
 
 if not OPENAI_API_KEY or not DATABASE_URL:
     raise RuntimeError("Missing OPENAI_API_KEY or DATABASE_URL")
 
-# OpenAI client with a timeout to avoid hanging requests
+# OpenAI client (timeouts prevent hangs)
 client = OpenAI(api_key=OPENAI_API_KEY, timeout=45.0)
+
+# Twelve Labs (required for video features)
+TWELVELABS_API_KEY = os.environ.get("TWELVELABS_API_KEY")
+if not TWELVELABS_API_KEY:
+    raise RuntimeError("Missing TWELVELABS_API_KEY")
+tl_client = TwelveLabs(api_key=TWELVELABS_API_KEY)
 
 
 # ============================================================
 #                         APP
 # ============================================================
 
-app = FastAPI(title="Happy Face Ads API", version="1.0.0")
+app = FastAPI(title="Happy Face Ads API", version="1.1.0")
 
-# CORS: prefer explicit origins; also allow *.vercel.app if flag is true
 cors_kwargs: Dict[str, Any] = dict(
     allow_methods=["*"],
     allow_headers=["*"],
@@ -74,11 +81,9 @@ app.add_middleware(CORSMiddleware, **cors_kwargs)
 # ============================================================
 
 def get_conn():
-    """
-    Returns a psycopg connection with dict rows and pgvector registered.
-    """
+    """Psycopg connection with dict rows + pgvector adapter."""
     conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-    register_vector(conn)  # make Python list <-> pgvector work
+    register_vector(conn)  # python list <-> pgvector
     return conn
 
 
@@ -87,7 +92,7 @@ DB_BOOTSTRAP_SQL = f"""
 create extension if not exists vector;
 create extension if not exists pgcrypto;
 
--- Documents table
+-- Documents: your knowledge store
 create table if not exists public.documents (
   id uuid primary key default gen_random_uuid(),
   brand_id uuid null,
@@ -98,7 +103,7 @@ create table if not exists public.documents (
   created_at timestamptz default now()
 );
 
--- Embeddings table (uses EMBED_DIM)
+-- Embeddings: chunked text vectors
 create table if not exists public.embeddings (
   id bigserial primary key,
   doc_id uuid not null references public.documents(id) on delete cascade,
@@ -108,7 +113,7 @@ create table if not exists public.embeddings (
   created_at timestamptz default now()
 );
 
--- Briefs table
+-- Briefs: generated outputs
 create table if not exists public.briefs (
   id bigserial primary key,
   inputs jsonb not null,
@@ -116,39 +121,47 @@ create table if not exists public.briefs (
   created_at timestamptz default now()
 );
 
--- Fast vector search index (HNSW; available on PG 16/Supabase). If unavailable, switch to ivfflat.
+-- Videos: Twelve Labs ingestion tracking
+create table if not exists public.videos (
+  id uuid primary key default gen_random_uuid(),
+  source_url text not null,
+  index_id text not null,
+  video_id text not null,
+  status text not null default 'processing', -- processing|ready|failed|timeout
+  created_at timestamptz default now()
+);
+
+-- Video analyses: raw JSON results from TL
+create table if not exists public.video_analyses (
+  id bigserial primary key,
+  video_id_ref uuid not null references public.videos(id) on delete cascade,
+  analysis_type text not null,    -- 'open-ended' | 'gist' | 'summary'
+  prompt text,
+  output_json jsonb not null,
+  created_at timestamptz default now()
+);
+
+-- Vector index (try HNSW, fallback to IVF)
 do $$
 begin
   begin
     create index if not exists embeddings_embedding_hnsw
       on public.embeddings using hnsw (embedding vector_l2_ops);
   exception when others then
-    -- fallback try IVF if HNSW isn't available
     begin
       create index if not exists embeddings_embedding_ivf
         on public.embeddings using ivfflat (embedding vector_l2_ops) with (lists = 100);
     exception when others then
-      -- ignore if neither is available
       null;
     end;
   end;
 end $$;
 """
 
-
 @app.on_event("startup")
 def bootstrap_db():
-    """
-    Create required extensions/tables if they don't exist.
-    This is idempotent and safe to run on each startup.
-    """
-    try:
-        with get_conn() as conn:
-            conn.execute(DB_BOOTSTRAP_SQL)
-    except Exception as e:
-        # If bootstrap fails, it's still useful to start the app; errors will surface on first use.
-        # But we raise here to make it obvious in Render logs.
-        raise RuntimeError(f"DB bootstrap failed: {e}") from e
+    with get_conn() as conn:
+        conn.execute(DB_BOOTSTRAP_SQL)
 
 
 # ============================================================
@@ -156,21 +169,17 @@ def bootstrap_db():
 # ============================================================
 
 def embed(texts: List[str]) -> List[List[float]]:
-    """
-    Returns list of embeddings (list[float]) for the given texts.
-    """
+    """Return embeddings for texts; enforce dimension sanity."""
     if not texts:
         return []
     try:
         resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
         vectors = [d.embedding for d in resp.data]
-        # guard dimension
         for v in vectors:
             if len(v) != EMBED_DIM:
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Embedding dimension mismatch: got {len(v)}, expected {EMBED_DIM}. "
-                           f"Model={EMBED_MODEL}. Consider setting EMBED_DIM env to override."
+                    detail=f"Embedding dimension mismatch: got {len(v)}, expected {EMBED_DIM} (model={EMBED_MODEL})."
                 )
         return vectors
     except HTTPException:
@@ -210,6 +219,22 @@ class IngestText(BaseModel):
     brand_id: Optional[str] = None
     url: Optional[str] = None
 
+# Twelve Labs requests
+class VideoIngestReq(BaseModel):
+    url: HttpUrl
+    index_name: Optional[str] = "happyface-default"
+    visual: bool = True
+    audio: bool = True
+
+class VideoStatusReq(BaseModel):
+    task_id: str
+    video_row_id: str
+
+class VideoAnalyzeReq(BaseModel):
+    video_row_id: str
+    mode: str = "open-ended"  # 'open-ended' | 'gist' | 'summary'
+    prompt: Optional[str] = None  # required if open-ended
+
 
 # ============================================================
 #                       SMALL UTILS
@@ -227,7 +252,6 @@ def chunk_text(txt: str, max_chars: int = 2500, overlap: int = 250) -> List[str]
         chunks.append(txt[start:end])
         start = max(0, end - overlap)
     return chunks
-
 
 def _build_inputs_summary(req: GenerateReq) -> str:
     parts = [
@@ -268,6 +292,10 @@ JSON_INSTRUCTIONS = (
 )
 
 
+# ============================================================
+#               OPENAI CONCEPT GENERATION HELPERS
+# ============================================================
+
 def _call_for_concepts(context: str, req: GenerateReq, needed: int) -> List[Dict[str, Any]]:
     user = (
         f"CONTEXT (summarized training snippets):\n{context[:12000]}\n\n"
@@ -277,7 +305,6 @@ def _call_for_concepts(context: str, req: GenerateReq, needed: int) -> List[Dict
         "Escalations must be three crisp beats that heighten the bit.\n\n"
         + JSON_INSTRUCTIONS
     )
-
     try:
         chat = client.chat.completions.create(
             model=GEN_MODEL,
@@ -300,9 +327,41 @@ def _call_for_concepts(context: str, req: GenerateReq, needed: int) -> List[Dict
             if hook and prem and isinstance(esc, list) and len(esc) >= 3 and cta:
                 clean.append({"hook": hook, "premise": prem, "escalations": esc[:3], "cta": cta})
         return clean
-    except Exception as e:
-        # Return empty so caller can attempt a top-up call
+    except Exception:
         return []
+
+
+# ============================================================
+#                   TWELVE LABS HELPERS
+# ============================================================
+
+def tl_get_or_create_index(index_name: str = "happyface-default", use_visual=True, use_audio=True) -> str:
+    """
+    Create (or reuse) a TwelveLabs index and return its id.
+    """
+    models = []
+    if use_visual: models.append("visual")
+    if use_audio:  models.append("audio")
+    try:
+        idx = tl_client.indexes.create(index_name=index_name, models=models)
+        return idx.id
+    except Exception as e:
+        # If it already exists and SDK raises, surface a clear hint.
+        raise HTTPException(status_code=500, detail="Index creation failed. Create once in the TL console or store INDEX_ID.")
+
+def tl_upload_video(index_id: str, video_url: str) -> dict:
+    task = tl_client.tasks.create(index_id=index_id, video_url=video_url)
+    return {"task_id": task.id, "video_id": task.video_id}
+
+def tl_wait_until_ready(task_id: str, sleep_sec: int = 5, timeout_sec: int = 1800) -> str:
+    start = time.time()
+    while True:
+        res = tl_client.tasks.wait_for_done(task_id=task_id, sleep_interval=sleep_sec)
+        status = getattr(res, "status", None) or (res.get("status") if isinstance(res, dict) else None)
+        if status == "ready":
+            return "ready"
+        if time.time() - start > timeout_sec:
+            return status or "timeout"
 
 
 # ============================================================
@@ -311,17 +370,19 @@ def _call_for_concepts(context: str, req: GenerateReq, needed: int) -> List[Dict
 
 @app.get("/health")
 def health():
-    return {"ok": True, "embed_model": EMBED_MODEL, "embed_dim": EMBED_DIM}
+    return {
+        "ok": True,
+        "embed_model": EMBED_MODEL,
+        "embed_dim": EMBED_DIM
+    }
 
 
 @app.post("/ingest/text")
 def ingest_text(req: IngestText):
     if req.source_type not in ("internal", "inspo"):
         raise HTTPException(status_code=400, detail="source_type must be 'internal' or 'inspo'")
-
     chunks = chunk_text(req.text)
     vecs = embed(chunks)
-
     try:
         with get_conn() as conn, conn.transaction():
             doc = conn.execute(
@@ -332,13 +393,11 @@ def ingest_text(req: IngestText):
                 """,
                 (req.brand_id, req.source_type, req.title, req.url, req.text),
             ).fetchone()
-
             for i, (chunk, v) in enumerate(zip(chunks, vecs)):
                 conn.execute(
                     "insert into embeddings(doc_id, chunk_idx, text_chunk, embedding) values (%s,%s,%s,%s)",
-                    (doc["id"], i, chunk, v),  # pgvector adapter handles Python list
+                    (doc["id"], i, chunk, v),
                 )
-
         return {"status": "ok", "chunks": len(chunks), "doc_id": doc["id"]}
     except HTTPException:
         raise
@@ -349,7 +408,7 @@ def ingest_text(req: IngestText):
 @app.post("/generate/concepts")
 def generate_concepts(req: GenerateReq):
     try:
-        # 1) Build retrieval query from inputs
+        # Build retrieval query
         fields = [
             req.project_type, req.ad_type, req.industry, req.audience,
             " ".join(req.platforms or []),
@@ -363,10 +422,10 @@ def generate_concepts(req: GenerateReq):
             raise HTTPException(status_code=400, detail="Could not embed query.")
         q_vec = q_vec_list[0]
 
-        # 2) Pull nearest training chunks (internal then inspo)
+        # Retrieve nearest chunks
         with get_conn() as conn:
             internal = conn.execute(
-                f"""
+                """
                 select text_chunk from embeddings e
                 join documents d on d.id = e.doc_id
                 where d.source_type = 'internal'
@@ -377,7 +436,7 @@ def generate_concepts(req: GenerateReq):
             ).fetchall()
 
             inspo = conn.execute(
-                f"""
+                """
                 select text_chunk from embeddings e
                 join documents d on d.id = e.doc_id
                 where d.source_type = 'inspo'
@@ -389,18 +448,16 @@ def generate_concepts(req: GenerateReq):
 
         ctx = "\n\n".join([r["text_chunk"] for r in (internal + inspo)]) or "No prior docs yet."
 
-        # 3) Call model for exactly n concepts; top-up if short
+        # Generate exactly n concepts; top-up if short
         concepts: List[Dict[str, Any]] = _call_for_concepts(ctx, req, req.n)
         if len(concepts) < req.n:
             missing = req.n - len(concepts)
             more = _call_for_concepts(ctx, req, missing)
             concepts.extend(more)
 
-        # Last resort: avoid empty UI by duplicating if we got at least one
         while len(concepts) < req.n and concepts:
             concepts.append(concepts[len(concepts) % len(concepts)])
 
-        # 4) Persist brief
         with get_conn() as conn, conn.transaction():
             brief = conn.execute(
                 "insert into briefs(inputs, output_md) values (%s,%s) returning id",
@@ -437,3 +494,131 @@ def generate_rewrite(req: RewriteReq):
         data = {"hook": "", "premise": "", "escalations": [], "cta": ""}
 
     return {"script": data}
+
+
+# --------------------- Twelve Labs: Video Pipeline ----------------------
+
+@app.post("/videos/ingest")
+def videos_ingest(req: VideoIngestReq):
+    """Create/reuse index, upload video URL, store tracking row."""
+    try:
+        index_id = tl_get_or_create_index(req.index_name, req.visual, req.audio)
+        ids = tl_upload_video(index_id, str(req.url))
+        with get_conn() as conn, conn.transaction():
+            row = conn.execute(
+                """
+                insert into videos (source_url, index_id, video_id, status)
+                values (%s, %s, %s, %s)
+                returning id
+                """,
+                (str(req.url), index_id, ids["video_id"], "processing"),
+            ).fetchone()
+        return {"video_row_id": row["id"], "index_id": index_id, "video_id": ids["video_id"], "task_id": ids["task_id"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Video ingest failed: {str(e)[:300]}")
+
+
+@app.post("/videos/status")
+def videos_status(req: VideoStatusReq):
+    """Poll TL until 'ready'; mark the DB row when done."""
+    try:
+        status = tl_wait_until_ready(req.task_id)
+        if status == "ready":
+            with get_conn() as conn, conn.transaction():
+                conn.execute("update videos set status='ready' where id=%s", (req.video_row_id,))
+        elif status in ("failed", "timeout"):
+            with get_conn() as conn, conn.transaction():
+                conn.execute("update videos set status=%s where id=%s", (status, req.video_row_id))
+        return {"status": status}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Status check failed: {str(e)[:300]}")
+
+
+@app.post("/videos/analyze")
+def videos_analyze(req: VideoAnalyzeReq):
+    """
+    Analyze an indexed video via Twelve Labs, save raw JSON,
+    then flatten text into documents/embeddings so it fuels your RAG.
+    """
+    try:
+        # Load video row
+        with get_conn() as conn:
+            v = conn.execute("select * from videos where id=%s", (req.video_row_id,)).fetchone()
+            if not v:
+                raise HTTPException(status_code=404, detail="Video not found")
+            if v["status"] != "ready":
+                raise HTTPException(status_code=400, detail=f"Video status is {v['status']}, not ready")
+
+        video_id = v["video_id"]
+        analysis_type = req.mode
+        output_json: Dict[str, Any]
+
+        if req.mode == "gist":
+            # Titles / topics / hashtags
+            res = tl_client.gist(video_id=video_id, types=["title", "topic", "hashtag"])
+            output_json = res if isinstance(res, dict) else json.loads(json.dumps(res, default=lambda o: o.__dict__))
+        elif req.mode == "summary":
+            # Summaries / chapters / highlights
+            res = tl_client.summarize(video_id=video_id, types=["summary", "chapters", "highlights"])
+            output_json = res if isinstance(res, dict) else json.loads(json.dumps(res, default=lambda o: o.__dict__))
+        else:
+            # Open-ended (non-streaming)
+            if not (req.prompt and req.prompt.strip()):
+                raise HTTPException(status_code=400, detail="prompt is required for open-ended mode")
+            res = tl_client.analyze(video_id=video_id, prompt=req.prompt, temperature=0.4)
+            output_json = res if isinstance(res, dict) else json.loads(json.dumps(res, default=lambda o: o.__dict__))
+
+        # Save raw analysis
+        with get_conn() as conn, conn.transaction():
+            ana = conn.execute(
+                """
+                insert into video_analyses (video_id_ref, analysis_type, prompt, output_json)
+                values (%s,%s,%s,%s)
+                returning id
+                """,
+                (req.video_row_id, analysis_type, req.prompt, json.dumps(output_json)),
+            ).fetchone()
+
+        # Flatten JSON → readable text
+        def _flatten_text(obj):
+            if obj is None:
+                return ""
+            if isinstance(obj, str):
+                return obj
+            if isinstance(obj, (int, float)):
+                return str(obj)
+            if isinstance(obj, list):
+                return "\n".join(_flatten_text(x) for x in obj)
+            if isinstance(obj, dict):
+                return "\n".join(_flatten_text(v) for v in obj.values())
+            return ""
+
+        readable = _flatten_text(output_json).strip()
+
+        # Store readable text into documents/embeddings so /generate/concepts can retrieve it
+        if readable:
+            chunks = chunk_text(readable)
+            vecs = embed(chunks)
+            with get_conn() as conn, conn.transaction():
+                doc = conn.execute(
+                    """
+                    insert into documents(brand_id, source_type, title, url, text_content)
+                    values (%s,%s,%s,%s,%s)
+                    returning id
+                    """,
+                    (None, "internal", f"Video Analysis {ana['id']}", v["source_url"], readable),
+                ).fetchone()
+                for i, (chunk, vec) in enumerate(zip(chunks, vecs)):
+                    conn.execute(
+                        "insert into embeddings(doc_id, chunk_idx, text_chunk, embedding) values (%s,%s,%s,%s)",
+                        (doc["id"], i, chunk, vec),
+                    )
+
+        return {"analysis_id": ana["id"], "added_to_rag": bool(readable)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Video analyze failed: {str(e)[:350]}")
