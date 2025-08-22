@@ -10,3 +10,11 @@ body { @apply bg-neutral-950 text-neutral-100; }
 .input { @apply w-full p-3 rounded-lg bg-neutral-900 border border-neutral-800; }
 .label { @apply text-sm text-neutral-400; }
 .badge { @apply inline-flex items-center gap-2 px-3 py-1 rounded-full border border-neutral-700 text-sm; }
+/* Happy Face Yellow styles */
+.btn-selected { background: #f9d600; color: #111; border-color: #f9d600; }
+.chip { @apply px-3 py-1 rounded-full border border-neutral-700 text-sm; }
+.chip-selected { background: #f9d600; color: #111; border-color: #f9d600; }
+.grid-metrics { @apply grid grid-cols-2 md:grid-cols-3 gap-2; }
+.metric { @apply text-xs text-neutral-400; }
+.metric b { @apply text-neutral-100; }
+.badge { @apply text-xs px-2 py-0.5 rounded-full border border-neutral-700; }
