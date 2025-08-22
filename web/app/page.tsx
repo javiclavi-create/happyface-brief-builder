@@ -2,156 +2,253 @@
 import { useMemo, useState } from 'react';
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
 
-// very light parser that looks for section labels
-function parseConcepts(md: string){
-  const blocks = md.split('### ').filter(Boolean);
-  const out: any[] = [];
-  blocks.forEach((b, idx) => {
-    const lines = b.split('\n');
-    const title = lines[0]?.trim() || `Concept ${idx+1}`;
-    const data: any = { id: `c${idx+1}`, title, hook:'', premise:'', escalations:[], cta:'', raw: b.trim() };
-    let section = '';
-    for(let i=1;i<lines.length;i++){
-      const L = lines[i].trim();
-      const low = L.toLowerCase();
-      if(low.startsWith('**hook') || low.startsWith('hook')){ section='hook'; data.hook = L.replaceAll('*','').split(':').slice(1).join(':').trim(); continue; }
-      if(low.startsWith('**premise') || low.startsWith('premise')){ section='premise'; const content = L.replaceAll('*','').split(':').slice(1).join(':').trim(); if(content) data.premise = content; continue; }
-      if(low.startsWith('**escalations') || low.startsWith('escalations')){ section='esc'; continue; }
-      if(low.startsWith('**cta') || low.startsWith('cta')){ section='cta'; data.cta = L.replaceAll('*','').split(':').slice(1).join(':').trim(); continue; }
-      if(section==='esc'){
-        let s = L;
-        if (s.startsWith('- ')) s = s.slice(2);
-        else if (s.startsWith('– ')) s = s.slice(2);
-        else if (s.startsWith('* ')) s = s.slice(2);
-        if (s) data.escalations.push(s);
-      } else if(section==='premise' && L){
-        data.premise += (data.premise ? ' ' : '') + L;
-      }
-    }
-    out.push(data);
-  });
-  return out;
-}
+type Concept = { hook: string; premise: string; escalations: string[]; cta: string };
+
+const PLATFORMS = ["TikTok","Reels","Shorts"];
+const CONTENT_STYLES = ["UGC","Talking Head","Faceless Video","Skit","Parody"];
+const LEVERS = ["juxtaposition","absurd escalation","deadpan","pattern break"];
 
 export default function Home() {
-  const [form, setForm] = useState({
-    industry: '', service: '', audience: '', platforms: 'TikTok, Reels',
-    levers: ['juxtaposition','absurd escalation','deadpan'], n: 12
-  });
+  const [projectType, setProjectType] = useState<'product'|'service'>('product');
+  const [adType, setAdType] = useState<'static'|'video'>('video');
+
+  // form fields
+  const [industry, setIndustry] = useState('');
+  const [productName, setProductName] = useState('');
+  const [whatItDoes, setWhatItDoes] = useState('');
+  const [service, setService] = useState('');
+  const [audience, setAudience] = useState('');
+  const [platforms, setPlatforms] = useState<string[]>(["TikTok","Reels"]);
+  const [contentStyle, setContentStyle] = useState<string[]>(["Faceless Video"]);
+  const [levers, setLevers] = useState<string[]>([...LEVERS]); // always max intensity
+  const [n, setN] = useState(12);
+
   const [loading, setLoading] = useState(false);
-  const [markdown, setMarkdown] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string[]>([]);
+  const [concepts, setConcepts] = useState<Concept[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<number[]>([]);
+  const [rewriting, setRewriting] = useState(false);
+  const [rewriteResults, setRewriteResults] = useState<string[]>([]);
 
-  const concepts = useMemo(() => (markdown ? parseConcepts(markdown) : []), [markdown]);
-
-  const toggleLever = (l: string) => {
-    setForm(f => ({...f, levers: f.levers.includes(l) ? f.levers.filter(x=>x!==l) : [...f.levers, l]}));
+  const toggle = (arr: string[], set: (v: string[])=>void, item: string) => {
+    if (arr.includes(item)) set(arr.filter(x => x !== item));
+    else set([...arr, item]);
   };
 
-  async function onSubmit(e:any){
+  const canSubmit = useMemo(() => {
+    if (!industry || !audience) return false;
+    if (projectType === 'product' && (!productName || !whatItDoes)) return false;
+    if (projectType === 'service' && !service) return false;
+    return true;
+  }, [industry, audience, projectType, productName, whatItDoes, service]);
+
+  async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    setLoading(true); setMarkdown(null); setSelected([]);
-    const res = await fetch(`${API_BASE}/generate/concepts`,{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({
-        industry: form.industry,
-        service: form.service,
-        audience: form.audience,
-        platforms: form.platforms.split(',').map(s=>s.trim()),
-        levers: form.levers, n: form.n
-      })
-    });
-    const json = await res.json();
-    setMarkdown(json.markdown || '');
-    setLoading(false);
+    if (!canSubmit) return;
+    setLoading(true);
+    setError(null);
+    setConcepts([]);
+    setSelected([]);
+    try {
+      const body = {
+        project_type: projectType,
+        ad_type: adType,
+        industry,
+        product_name: projectType === 'product' ? productName : undefined,
+        what_it_does: projectType === 'product' ? whatItDoes : undefined,
+        service: projectType === 'service' ? service : undefined,
+        audience,
+        platforms,
+        content_style: contentStyle,
+        levers,
+        n
+      };
+      const res = await fetch(`${API_BASE}/generate/concepts`, {
+        method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(t || `Server error ${res.status}`);
+      }
+      const json = await res.json();
+      const list: Concept[] = json.concepts || [];
+      setConcepts(list);
+    } catch (err:any) {
+      setError(err.message || 'Something went wrong');
+    } finally {
+      setLoading(false);
+    }
   }
 
-  function togglePick(id: string){
-    setSelected(prev => prev.includes(id) ? prev.filter(x=>x!==id) : [...prev, id]);
-  }
-
-  async function sendSelectedToRewrite(){
-    const picks = concepts.filter(c=>selected.includes(c.id));
-    const results: any[] = [];
-    for (const c of picks){
-      const res = await fetch(`${API_BASE}/generate/rewrite`,{
+  async function rewriteOne(idx: number) {
+    const c = concepts[idx];
+    setRewriting(true);
+    try {
+      const res = await fetch(`${API_BASE}/generate/rewrite`, {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ concept_text: c.raw, duration_s: 30, platform: 'TikTok', style: 'faceless' })
+        body: JSON.stringify({
+          concept_text: JSON.stringify(c),
+          duration_s: 30, platform: (platforms[0] || 'TikTok'),
+          style: (contentStyle[0] || 'Faceless Video')
+        })
       });
       const json = await res.json();
-      results.push({ title: c.title, script: json.script });
+      setRewriteResults([json.script]);
+    } catch (e:any) {
+      setError(e.message || 'Rewrite failed');
+    } finally {
+      setRewriting(false);
     }
-    localStorage.setItem('rewrites', JSON.stringify(results));
-    window.location.href = '/rewrite';
+  }
+
+  async function rewriteBatch() {
+    if (selected.length === 0) return;
+    setRewriting(true);
+    try {
+      const chosen = selected.map(i => concepts[i]);
+      const res = await fetch(`${API_BASE}/generate/rewrite-batch`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          concepts: chosen, duration_s: 30,
+          platform: (platforms[0] || 'TikTok'),
+          style: (contentStyle[0] || 'Faceless Video')
+        })
+      });
+      const json = await res.json();
+      setRewriteResults(json.scripts || []);
+    } catch (e:any) {
+      setError(e.message || 'Batch rewrite failed');
+    } finally {
+      setRewriting(false);
+    }
   }
 
   return (
     <main className="space-y-6">
+      {/* FORM */}
       <section className="card space-y-4">
-        <h2 className="text-xl font-medium">New Brief</h2>
+        <h2 className="text-xl font-medium">Pitch Room</h2>
+
+        {/* toggles */}
+        <div className="flex flex-wrap gap-3">
+          <div className="flex items-center gap-2">
+            <span className="label">Type:</span>
+            <button type="button" className={`chip ${projectType==='product'?'chip-selected':''}`} onClick={()=>setProjectType('product')}>Product</button>
+            <button type="button" className={`chip ${projectType==='service'?'chip-selected':''}`} onClick={()=>setProjectType('service')}>Service</button>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="label">Ad:</span>
+            <button type="button" className={`chip ${adType==='static'?'chip-selected':''}`} onClick={()=>setAdType('static')}>Static</button>
+            <button type="button" className={`chip ${adType==='video'?'chip-selected':''}`} onClick={()=>setAdType('video')}>Video</button>
+          </div>
+        </div>
+
         <form className="grid grid-cols-1 md:grid-cols-2 gap-4" onSubmit={onSubmit}>
-          <div><label className="label">Industry</label><input className="input" value={form.industry} onChange={e=>setForm({...form, industry:e.target.value})}/></div>
-          <div><label className="label">Service</label><input className="input" value={form.service} onChange={e=>setForm({...form, service:e.target.value})}/></div>
-          <div><label className="label">Audience</label><input className="input" value={form.audience} onChange={e=>setForm({...form, audience:e.target.value})}/></div>
-          <div><label className="label">Platforms</label><input className="input" value={form.platforms} onChange={e=>setForm({...form, platforms:e.target.value})}/></div>
+          <div><label className="label">Industry</label><input className="input" value={industry} onChange={e=>setIndustry(e.target.value)} /></div>
+          <div><label className="label">Audience</label><input className="input" value={audience} onChange={e=>setAudience(e.target.value)} /></div>
+
+          {projectType==='product' && (
+            <>
+              <div><label className="label">Product name</label><input className="input" value={productName} onChange={e=>setProductName(e.target.value)} /></div>
+              <div><label className="label">What it does</label><input className="input" value={whatItDoes} onChange={e=>setWhatItDoes(e.target.value)} /></div>
+            </>
+          )}
+          {projectType==='service' && (
+            <div className="md:col-span-2"><label className="label">Service</label><input className="input" value={service} onChange={e=>setService(e.target.value)} /></div>
+          )}
+
+          {/* Platforms */}
           <div className="md:col-span-2">
-            <label className="label">Funny levers</label>
+            <label className="label">Platforms</label>
             <div className="flex flex-wrap gap-2 mt-2">
-              {['juxtaposition','absurd escalation','deadpan','pattern break'].map(l=>{
-                const picked = form.levers.includes(l);
-                return (
-                  <button
-                    key={l}
-                    type="button"
-                    className={`btn ${picked ? 'btn-selected' : ''}`}
-                    onClick={()=>toggleLever(l)}
-                  >{l}</button>
-                );
-              })}
+              {PLATFORMS.map(p => (
+                <button key={p} type="button"
+                  className={`chip ${platforms.includes(p)?'chip-selected':''}`}
+                  onClick={()=>toggle(platforms, setPlatforms, p)}>{p}</button>
+              ))}
             </div>
           </div>
+
+          {/* Content Style */}
+          <div className="md:col-span-2">
+            <label className="label">Content Style</label>
+            <div className="flex flex-wrap gap-2 mt-2">
+              {CONTENT_STYLES.map(s => (
+                <button key={s} type="button"
+                  className={`chip ${contentStyle.includes(s)?'chip-selected':''}`}
+                  onClick={()=>toggle(contentStyle, setContentStyle, s)}>{s}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Funny Levers (always max) */}
+          <div className="md:col-span-2">
+            <label className="label">Funny Levers (always 10/10)</label>
+            <div className="flex flex-wrap gap-2 mt-2">
+              {LEVERS.map(l => (
+                <button key={l} type="button"
+                  className={`chip ${levers.includes(l)?'chip-selected':''}`}
+                  onClick={()=>toggle(levers, setLevers, l)}>{l}</button>
+              ))}
+            </div>
+          </div>
+
           <div className="md:col-span-2 flex items-center gap-3">
             <label className="label"># Concepts</label>
-            <input type="number" className="input w-24" value={form.n} onChange={e=>setForm({...form, n:Number(e.target.value)})}/>
-            <button className="btn" type="submit" disabled={loading}>{loading?'Generating…':'Generate'}</button>
+            <input type="number" className="input w-24" value={n} onChange={e=>setN(Number(e.target.value))}/>
+            <button className="btn" type="submit" disabled={loading || !canSubmit}>{loading?'Generating…':'Generate'}</button>
           </div>
         </form>
+        {error && <div className="text-red-400 text-sm">{error}</div>}
       </section>
 
-      {concepts.length>0 && (
+      {/* RESULTS */}
+      {concepts.length > 0 && (
         <section className="space-y-3">
           <div className="flex items-center justify-between">
-            <h3 className="text-lg font-medium">Pitch Room Output</h3>
-            <button className="btn btn-selected" disabled={!selected.length} onClick={sendSelectedToRewrite}>
-              Send {selected.length||''} to Rewrite →
-            </button>
+            <h3 className="text-lg font-medium">Concepts</h3>
+            <div className="flex items-center gap-2">
+              <span className="label">Selected: {selected.length}</span>
+              <button className="btn" onClick={rewriteBatch} disabled={rewriting || selected.length===0}>
+                {rewriting ? 'Rewriting…' : 'Send Selected to Rewrite'}
+              </button>
+            </div>
           </div>
           <div className="grid md:grid-cols-2 gap-4">
-            {concepts.map(c=> (
-              <div key={c.id} className={`card space-y-2 ${selected.includes(c.id)?'ring-2 ring-[var(--happy-yellow)]':''}`}>
+            {concepts.map((c, i) => (
+              <div key={i} className="card space-y-3">
                 <div className="flex items-center justify-between">
-                  <h4 className="font-semibold">{c.title}</h4>
-                  <label className="badge">
-                    <input type="checkbox" className="mr-2" checked={selected.includes(c.id)} onChange={()=>togglePick(c.id)} /> pick
-                  </label>
-                </div>
-                {c.hook && <p><span className="font-semibold">Hook: </span>{c.hook}</p>}
-                {c.premise && <p><span className="font-semibold">Premise: </span>{c.premise}</p>}
-                {c.escalations?.length>0 && (
-                  <div>
-                    <div className="font-semibold">Escalations</div>
-                    <ul className="list-disc list-inside text-sm space-y-1">
-                      {c.escalations.map((e: string, i: number) => (<li key={i}>{e}</li>))}
-                    </ul>
+                  <div className="flex items-center gap-2">
+                    <input type="checkbox" checked={selected.includes(i)} onChange={()=>{
+                      setSelected(s => s.includes(i) ? s.filter(x=>x!==i) : [...s, i]);
+                    }}/>
+                    <div className="text-sm text-neutral-400">Select</div>
                   </div>
-                )}
-                {c.cta && <p><span className="font-semibold">CTA: </span>{c.cta}</p>}
-                <div className="pt-2">
-                  <button className="btn" onClick={async()=>{ setSelected([c.id]); await sendSelectedToRewrite(); }}>
-                    Send to Rewrite
-                  </button>
+                  <button className="btn" onClick={()=>rewriteOne(i)}>Send to Rewrite</button>
                 </div>
+
+                <div><div className="font-semibold">Hook</div><div className="text-sm">{c.hook}</div></div>
+                <div><div className="font-semibold">Premise</div><div className="text-sm">{c.premise}</div></div>
+                <div>
+                  <div className="font-semibold">Escalations</div>
+                  <ul className="list-disc list-inside text-sm space-y-1">
+                    {c.escalations.map((e: string, idx: number) => (<li key={idx}>{e}</li>))}
+                  </ul>
+                </div>
+                <div><div className="font-semibold">CTA</div><div className="text-sm">{c.cta}</div></div>
               </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* REWRITE RESULTS */}
+      {rewriteResults.length > 0 && (
+        <section className="space-y-3">
+          <h3 className="text-lg font-medium">Rewrites</h3>
+          <div className="grid md:grid-cols-2 gap-4">
+            {rewriteResults.map((r, i) => (
+              <div key={i} className="card whitespace-pre-wrap text-sm">{r}</div>
             ))}
           </div>
         </section>
