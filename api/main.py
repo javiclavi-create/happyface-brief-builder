@@ -5,8 +5,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg
 from psycopg.rows import dict_row
-from pgvector.psycopg import register_vector
-from pgvector import Vector
 from openai import OpenAI
 
 # --- Env ---
@@ -43,7 +41,12 @@ app.add_middleware(
 # --- DB helper ---
 def get_conn():
     conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-    register_vector(conn)  # register pgvector adapter for this connection
+    # registering the vector type is optional for our usage; keep it best-effort
+    try:
+        from pgvector.psycopg import register_vector
+        register_vector(conn)
+    except Exception:
+        pass
     return conn
 
 # --- Small utils ---
@@ -58,7 +61,8 @@ def chunk_text(txt: str, max_chars: int = 2500, overlap: int = 250):
         end = min(len(txt), start + max_chars)
         chunks.append(txt[start:end])
         start = end - overlap
-        if start < 0: start = 0
+        if start < 0:
+            start = 0
     return chunks
 
 def embed(texts: List[str]) -> List[List[float]]:
@@ -69,6 +73,11 @@ def embed(texts: List[str]) -> List[List[float]]:
 
 def dict_clean(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in d.items() if v not in (None, "", [], {})}
+
+def to_vec_literal(v: List[float]) -> str:
+    # Build a pgvector literal like: "[0.12,-0.34,...]"
+    # keep it compact to avoid huge payloads
+    return "[" + ",".join(f"{x:.6f}" for x in v) + "]"
 
 # --- Models for generation ---
 class GenerateReq(BaseModel):
@@ -106,12 +115,12 @@ def describe_image(public_url: str) -> str:
             messages=[
                 {"role": "system", "content": "You are a sharp creative director describing ad visuals."},
                 {"role": "user", "content": [
-                    {"type": "text", "text": "Describe the visual style, tone, on-screen text, props, layout, and color palette."},
-                    {"type": "image_url", "image_url": {"url": public_url}}
+                    {"type":"input_text","text":"Describe the visual style, tone, on-screen text, props, layout, and color palette."},
+                    {"type":"input_image","image_url": public_url}
                 ]}
             ]
         )
-        return (msg.choices[0].message.content or "").strip()
+        return msg.choices[0].message.content.strip()
     except Exception:
         return ""
 
@@ -157,12 +166,12 @@ def ingest_text(
         ).fetchone()
         for i, (chunk, v) in enumerate(zip(chunks, vecs)):
             conn.execute(
-                "insert into embeddings(doc_id, chunk_idx, text_chunk, embedding) values (%s,%s,%s,%s)",
-                (doc["id"], i, chunk, Vector(v))   # <-- IMPORTANT
+                "insert into embeddings(doc_id, chunk_idx, text_chunk, embedding) values (%s,%s,%s,%s::vector)",
+                (doc["id"], i, chunk, to_vec_literal(v))
             )
     return {"status": "ok", "chunks": len(chunks)}
 
-# 2) Ingest with optional file (image or video) + optional link + metrics
+# 2) Ingest with optional file (image or video) + optional link + metrics (best UX)
 @app.post("/ingest/media")
 async def ingest_media(
     title: str = Form(...),
@@ -229,8 +238,8 @@ async def ingest_media(
         ).fetchone()
         for i, (chunk, v) in enumerate(zip(chunks, vecs)):
             conn.execute(
-                "insert into embeddings(doc_id, chunk_idx, text_chunk, embedding) values (%s,%s,%s,%s)",
-                (doc["id"], i, chunk, Vector(v))   # <-- IMPORTANT
+                "insert into embeddings(doc_id, chunk_idx, text_chunk, embedding) values (%s,%s,%s,%s::vector)",
+                (doc["id"], i, chunk, to_vec_literal(v))
             )
 
     return {"status": "ok", "chunks": len(chunks), "url": public_url}
@@ -248,23 +257,24 @@ def generate_concepts(req: GenerateReq):
     q = " | ".join([f for f in fields if f])
 
     q_vec = embed([q])[0]
+    q_lit = to_vec_literal(q_vec)
 
     with get_conn() as conn:
         internal = conn.execute(
             """select text_chunk from embeddings e
                join documents d on d.id = e.doc_id
                where d.source_type = 'internal'
-               order by e.embedding <=> %s
+               order by e.embedding <=> %s::vector
                limit 8""",
-            (Vector(q_vec),)   # <-- IMPORTANT
+            (q_lit,)
         ).fetchall()
         inspo = conn.execute(
             """select text_chunk from embeddings e
                join documents d on d.id = e.doc_id
                where d.source_type = 'inspo'
-               order by e.embedding <=> %s
+               order by e.embedding <=> %s::vector
                limit 4""",
-            (Vector(q_vec),)   # <-- IMPORTANT
+            (q_lit,)
         ).fetchall()
 
     ctx = "\n\n".join([r["text_chunk"] for r in (internal + inspo)]) or "No prior docs yet."
