@@ -141,7 +141,7 @@ export default function Home() {
                   <div>
                     <div className="font-semibold">Escalations</div>
                     <ul className="list-disc list-inside text-sm space-y-1">
-                      {c.escalations.map((e,i)=>(<li key={i}>{e}</li>))}
+                      {c.escalations.map((e: string, i: number) => (<li key={i}>{e}</li>))}
                     </ul>
                   </div>
                 )}
